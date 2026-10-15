@@ -91,7 +91,7 @@ server.resource("investigation-guide", "fraudgraph://guide", async (uri) => ({
 server.tool(
   "query_graph",
   "Run a Cypher query against the FalkorDB fraud graph. Use this to traverse accounts, transactions, merchants, devices, fraud cases, and alerts.",
-  { query: z.string().describe("Cypher query to execute"), params: z.record(z.union([z.string(), z.number(), z.boolean()])).optional().describe("Query parameters") },
+  { query: z.string().describe("Cypher query to execute"), params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional().describe("Query parameters") },
   async ({ query, params }) => {
     try {
       const graph = await getGraph();
@@ -127,7 +127,7 @@ server.tool(
       const account = accResult.data?.[0] as Record<string, unknown> | undefined;
       if (!account) return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Account not found" }) }] };
 
-      const accId = account.id;
+      const accId = account.id as string;
 
       const [txResult, devResult, caseResult, alertResult, sharedDevResult] = await Promise.all([
         graph.query(
@@ -201,7 +201,7 @@ server.tool(
         `MATCH (a:Account) WHERE toLower(a.name) CONTAINS toLower($name) OR a.id = $name RETURN a.id AS id LIMIT 1`,
         { params: { name: accountName } }
       );
-      const accId = (accResult.data?.[0] as Record<string, unknown>)?.id;
+      const accId = (accResult.data?.[0] as Record<string, unknown>)?.id as string | undefined;
       if (!accId) return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Account not found" }) }] };
 
       const flowResult = await graph.query(

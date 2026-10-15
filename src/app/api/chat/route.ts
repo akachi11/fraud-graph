@@ -116,7 +116,7 @@ round() takes 1 arg. No EXISTS {}. Use toLower()+CONTAINS for fuzzy matching. Bo
           const account = accResult.data?.[0];
           if (!account) return { error: "Account not found" };
 
-          const accId = (account as Record<string, unknown>).id;
+          const accId = (account as Record<string, unknown>).id as string;
 
           const txResult = await graph.query(
             `MATCH (a:Account {id: $id})-[:SENT]->(tx:Transaction)-[:RECEIVED_BY]->(recv:Account)
@@ -210,7 +210,7 @@ round() takes 1 arg. No EXISTS {}. Use toLower()+CONTAINS for fuzzy matching. Bo
              RETURN a.id AS id LIMIT 1`,
             { params: { name: accountName } }
           );
-          const accId = (accResult.data?.[0] as Record<string, unknown>)?.id;
+          const accId = (accResult.data?.[0] as Record<string, unknown>)?.id as string | undefined;
           if (!accId) return { error: "Account not found" };
 
           const flowResult = await graph.query(
