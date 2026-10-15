@@ -4,7 +4,7 @@
 
 Built for [Graph Hacks: Context for AI Agents](https://graphhacks.devpost.com/) — Track 1: Agents That Act on Connected Data.
 
-> **Live Demo:** [fraudgraph.vercel.app](https://fraudgraph.vercel.app)
+> **Live Demo:** [fraud-graph-self.vercel.app](https://fraud-graph-self.vercel.app)
 
 ---
 
