@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "fraudgraph": {
+      "command": "npx",
+      "args": ["tsx", "mcp-server.ts"],
+      "cwd": "/Users/Game/Desktop/fraud-graph",
+      "env": {
+        "FALKORDB_HOST": "localhost",
+        "FALKORDB_PORT": "6379"
+      }
+    }
+  }
+}

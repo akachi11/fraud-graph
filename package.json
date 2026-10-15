@@ -6,12 +6,23 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "mcp": "npx tsx mcp-server.ts",
+    "mcp:build": "npx tsc --esModuleInterop --module nodenext --moduleResolution nodenext --target es2022 --outDir dist --skipLibCheck mcp-server.ts"
   },
   "dependencies": {
+    "@ai-sdk/google": "^4.0.93",
+    "@ai-sdk/react": "^4.0.140",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "ai": "^7.0.137",
+    "falkordb": "^6.8.0",
+    "lucide-react": "^1.55.0",
     "next": "16.4.0",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",
@@ -21,6 +32,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.4.0",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5"
   }
 }
