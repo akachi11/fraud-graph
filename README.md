@@ -163,12 +163,58 @@ Add to your MCP client config (e.g., Claude Desktop):
 - **MCP:** Model Context Protocol SDK — stdio server with Zod schemas
 - **Visualization:** Custom force-directed graph on Canvas 2D
 
+## Key Cypher Queries
+
+The agent's tools wrap these Cypher queries against FalkorDB:
+
+**Circular Flow Detection (3-hop, temporal ordering):**
+```cypher
+MATCH (a:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(b:Account)
+      -[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(c:Account)
+      -[:SENT]->(tx3:Transaction)-[:RECEIVED_BY]->(a)
+WHERE tx2.timestamp > tx1.timestamp AND tx3.timestamp > tx2.timestamp
+RETURN a.name, b.name, c.name, tx1.amount, tx2.amount, tx3.amount,
+       tx1.timestamp, tx2.timestamp, tx3.timestamp
+```
+
+**Multi-hop Money Flow Tracing (2 hops with temporal ordering):**
+```cypher
+MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(a2:Account)
+      -[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(a3:Account)
+WHERE tx2.timestamp > tx1.timestamp
+RETURN start.name, a2.name, a3.name, tx1.amount, tx2.amount,
+       tx1.timestamp, tx2.timestamp, a2.risk_score, a3.risk_score
+```
+
+**Structuring Detection (below reporting thresholds):**
+```cypher
+MATCH (a:Account)-[:SENT]->(tx:Transaction)
+WHERE (tx.amount >= 4500 AND tx.amount < 5000)
+   OR (tx.amount >= 9000 AND tx.amount < 10000)
+RETURN a.id, a.name, tx.amount, tx.timestamp, tx.type
+ORDER BY tx.amount DESC
+```
+
+**Shared Device Detection:**
+```cypher
+MATCH (a1:Account)-[:SHARES_DEVICE]->(a2:Account)
+MATCH (a1)-[:USES]->(d:Device)
+RETURN a1.name, a2.name, d.fingerprint, d.type, d.is_vpn, d.country
+```
+
+**Geographic Mismatch:**
+```cypher
+MATCH (a:Account)-[:USES]->(d:Device)
+WHERE a.country <> d.country
+RETURN a.name, a.country, d.country, d.is_vpn, d.ip_address
+```
+
 ## Example Queries
 
-- "Investigate Viktor's account for fraud"
+- "Investigate Priya Miller's account for fraud"
 - "Show me all accounts sharing devices"
 - "Are there any money laundering patterns?"
-- "Trace money flow from Olga Moore with 3 hops"
+- "Trace money flow from Priya Miller with 3 hops"
 - "Which accounts have transactions at shell companies?"
 - "Detect structuring patterns across all accounts"
 
