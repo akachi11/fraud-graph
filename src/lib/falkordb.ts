@@ -9,6 +9,7 @@ async function getDB() {
         host: process.env.FALKORDB_HOST || "localhost",
         port: Number(process.env.FALKORDB_PORT) || 6379,
       },
+      password: process.env.FALKORDB_PASSWORD || undefined,
     });
   }
   return db;
