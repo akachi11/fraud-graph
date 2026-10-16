@@ -25,10 +25,11 @@ Nodes: Account (id, name, email, phone, account_type, created_date, kyc_verified
 Relationships: (Account)-[:SENT]->(Transaction)-[:RECEIVED_BY]->(Account), (Transaction)-[:AT]->(Merchant), (Account)-[:USES]->(Device), (Device)-[:USED_IN]->(Transaction), (Account)-[:FLAGGED_IN]->(FraudCase), (FraudCase)-[:INVOLVES]->(Transaction), (Account)-[:HAS_ALERT]->(Alert), (Alert)-[:TRIGGERED_BY]->(Transaction), (Account)-[:SHARES_DEVICE]->(Account).
 
 ## Investigation Protocol
-1. Start with the subject — use investigate_account or query_graph
-2. Optionally trace money flow or detect patterns (1 more tool call)
-3. WRITE your analysis — explain what the graph paths revealed, use tables, assess risk
-4. Optionally flag_account or escalate_case if warranted
+1. Start with the subject — use investigate_account (it includes circular flow detection and inbound transactions)
+2. If circular flows are detected, highlight them prominently — money returning to the origin account is a critical laundering signal
+3. Optionally trace money flow or detect patterns for deeper analysis (1 more tool call)
+4. WRITE your analysis — explain what the graph paths revealed, use tables, assess risk
+5. Optionally flag_account or escalate_case if warranted
 
 ## Red Flags
 Amounts just below $5k/$10k (structuring), unverified KYC + large transfers, VPN+emulator combos, geo mismatches, shared devices, circular money flows, shell company transactions, velocity anomalies.
@@ -123,7 +124,15 @@ round() takes 1 arg. No EXISTS {}. Use toLower()+CONTAINS for fuzzy matching. Bo
              OPTIONAL MATCH (tx)-[:AT]->(m:Merchant)
              RETURN tx.id AS txId, tx.amount AS amount, tx.type AS type, tx.channel AS channel,
                     tx.timestamp AS timestamp, tx.status AS status, tx.is_international AS intl,
-                    recv.name AS receiver, m.name AS merchant, m.category AS merchant_category
+                    recv.name AS receiver, recv.risk_score AS receiver_risk, m.name AS merchant, m.category AS merchant_category
+             ORDER BY tx.timestamp DESC LIMIT 15`,
+            { params: { id: accId } }
+          );
+
+          const inboundResult = await graph.query(
+            `MATCH (sender:Account)-[:SENT]->(tx:Transaction)-[:RECEIVED_BY]->(a:Account {id: $id})
+             RETURN tx.id AS txId, tx.amount AS amount, tx.type AS type,
+                    tx.timestamp AS timestamp, sender.name AS sender, sender.risk_score AS sender_risk
              ORDER BY tx.timestamp DESC LIMIT 15`,
             { params: { id: accId } }
           );
@@ -156,13 +165,27 @@ round() takes 1 arg. No EXISTS {}. Use toLower()+CONTAINS for fuzzy matching. Bo
             { params: { id: accId } }
           );
 
+          const circularResult = await graph.query(
+            `MATCH (a:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(b:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(a)
+             WHERE tx2.timestamp > tx1.timestamp
+             RETURN a.name AS account, tx1.amount AS sent_amount, b.name AS through_account, tx2.amount AS returned_amount, tx1.timestamp AS sent_time, tx2.timestamp AS return_time
+             UNION ALL
+             MATCH (a:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(b:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(c:Account)-[:SENT]->(tx3:Transaction)-[:RECEIVED_BY]->(a)
+             WHERE tx2.timestamp > tx1.timestamp AND tx3.timestamp > tx2.timestamp
+             RETURN a.name AS account, tx1.amount AS sent_amount, b.name + ' -> ' + c.name AS through_account, tx3.amount AS returned_amount, tx1.timestamp AS sent_time, tx3.timestamp AS return_time`,
+            { params: { id: accId } }
+          );
+
           return {
             account,
             recentTransactions: txResult.data ?? [],
+            inboundTransactions: inboundResult.data ?? [],
             devices: devResult.data ?? [],
             fraudCases: caseResult.data ?? [],
             alerts: alertResult.data ?? [],
             sharedDeviceAccounts: sharedDevResult.data ?? [],
+            circularFlows: circularResult.data ?? [],
+            circularFlowDetected: (circularResult.data?.length ?? 0) > 0,
           };
         } catch (e) {
           return { error: String(e) };
@@ -172,7 +195,7 @@ round() takes 1 arg. No EXISTS {}. Use toLower()+CONTAINS for fuzzy matching. Bo
 
     trace_money_flow: tool({
       description:
-        "Trace the flow of money from an account through multiple hops. Follows SENT→Transaction→RECEIVED_BY→Account chains to detect circular flows, money mule networks, and layering. Essential for money laundering investigations.",
+        "Trace the flow of money from an account through multiple hops with temporal ordering (only follows paths where each transaction happened after the previous one). Detects circular flows (money returning to origin via 2 or 3 hops), amount correlation between hops, and layering patterns. Essential for money laundering investigations.",
       inputSchema: jsonSchema({
         type: "object" as const,
         properties: {
@@ -213,34 +236,53 @@ round() takes 1 arg. No EXISTS {}. Use toLower()+CONTAINS for fuzzy matching. Bo
           const accId = (accResult.data?.[0] as Record<string, unknown>)?.id as string | undefined;
           if (!accId) return { error: "Account not found" };
 
-          const flowResult = await graph.query(
-            `MATCH path = (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(a2:Account)${
-              depth >= 2 ? `-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(a3:Account)` : ""
-            }${
-              depth >= 3 ? `-[:SENT]->(tx3:Transaction)-[:RECEIVED_BY]->(a4:Account)` : ""
-            }
-             WHERE tx1.amount >= $min${depth >= 2 ? " AND tx2.amount >= $min" : ""}${depth >= 3 ? " AND tx3.amount >= $min" : ""}
-             RETURN start.name AS hop0, tx1.amount AS amt1, a2.name AS hop1${
-              depth >= 2 ? ", tx2.amount AS amt2, a3.name AS hop2" : ""
-            }${
-              depth >= 3 ? ", tx3.amount AS amt3, a4.name AS hop3" : ""
-            }
-             LIMIT 20`,
+          let flowQuery: string;
+          if (depth === 1) {
+            flowQuery = `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(a2:Account)
+             WHERE tx1.amount >= $min
+             RETURN start.name AS hop0, tx1.amount AS amt1, tx1.timestamp AS time1, a2.name AS hop1, a2.risk_score AS hop1_risk
+             ORDER BY tx1.timestamp LIMIT 20`;
+          } else if (depth === 2) {
+            flowQuery = `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(a2:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(a3:Account)
+             WHERE tx1.amount >= $min AND tx2.amount >= $min AND tx2.timestamp > tx1.timestamp
+             RETURN start.name AS hop0, tx1.amount AS amt1, tx1.timestamp AS time1, a2.name AS hop1,
+                    tx2.amount AS amt2, tx2.timestamp AS time2, a3.name AS hop2, a3.risk_score AS hop2_risk
+             ORDER BY tx1.timestamp LIMIT 20`;
+          } else {
+            flowQuery = `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(a2:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(a3:Account)-[:SENT]->(tx3:Transaction)-[:RECEIVED_BY]->(a4:Account)
+             WHERE tx1.amount >= $min AND tx2.amount >= $min AND tx3.amount >= $min AND tx2.timestamp > tx1.timestamp AND tx3.timestamp > tx2.timestamp
+             RETURN start.name AS hop0, tx1.amount AS amt1, tx1.timestamp AS time1, a2.name AS hop1,
+                    tx2.amount AS amt2, tx2.timestamp AS time2, a3.name AS hop2,
+                    tx3.amount AS amt3, tx3.timestamp AS time3, a4.name AS hop3, a4.risk_score AS hop3_risk
+             ORDER BY tx1.timestamp LIMIT 20`;
+          }
+
+          const flowResult = await graph.query(flowQuery, { params: { id: accId, min: minAmount } });
+
+          const circular2Result = await graph.query(
+            `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(mid:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(start)
+             WHERE tx1.amount >= $min AND tx2.amount >= $min AND tx2.timestamp > tx1.timestamp
+             RETURN start.name AS from_account, tx1.amount AS sent_amount, tx1.timestamp AS sent_time,
+                    mid.name AS through_account, tx2.amount AS returned_amount, tx2.timestamp AS return_time,
+                    2 AS hops`,
             { params: { id: accId, min: minAmount } }
           );
 
-          const circularResult = await graph.query(
-            `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(mid:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(start)
-             WHERE tx1.amount >= $min AND tx2.amount >= $min
-             RETURN start.name AS from_account, tx1.amount AS sent_amount,
-                    mid.name AS through_account, tx2.amount AS returned_amount`,
+          const circular3Result = await graph.query(
+            `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(mid1:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(mid2:Account)-[:SENT]->(tx3:Transaction)-[:RECEIVED_BY]->(start)
+             WHERE tx1.amount >= $min AND tx2.amount >= $min AND tx3.amount >= $min AND tx2.timestamp > tx1.timestamp AND tx3.timestamp > tx2.timestamp
+             RETURN start.name AS from_account, tx1.amount AS sent_amount, tx1.timestamp AS sent_time,
+                    mid1.name + ' -> ' + mid2.name AS through_account, tx3.amount AS returned_amount, tx3.timestamp AS return_time,
+                    3 AS hops`,
             { params: { id: accId, min: minAmount } }
           );
+
+          const allCircular = [...(circular2Result.data ?? []), ...(circular3Result.data ?? [])];
 
           return {
             moneyFlow: flowResult.data ?? [],
-            circularFlows: circularResult.data ?? [],
-            circularFlowDetected: (circularResult.data?.length ?? 0) > 0,
+            circularFlows: allCircular,
+            circularFlowDetected: allCircular.length > 0,
           };
         } catch (e) {
           return { error: String(e) };
@@ -292,10 +334,10 @@ round() takes 1 arg. No EXISTS {}. Use toLower()+CONTAINS for fuzzy matching. Bo
             case "structuring": {
               const result = await graph.query(
                 `MATCH (a:Account)-[:SENT]->(tx:Transaction)
-                 WHERE tx.amount >= 4500 AND tx.amount < 5000
+                 WHERE (tx.amount >= 4500 AND tx.amount < 5000) OR (tx.amount >= 9000 AND tx.amount < 10000)
                  RETURN a.name AS account, a.id AS accountId, tx.amount AS amount,
                         tx.timestamp AS timestamp, tx.type AS type,
-                        count(tx) AS suspicious_tx_count
+                        CASE WHEN tx.amount < 5000 THEN '$5k threshold' ELSE '$10k threshold' END AS threshold
                  ORDER BY tx.timestamp DESC`
               );
               return { pattern: "structuring", results: result.data ?? [] };

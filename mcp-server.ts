@@ -131,13 +131,20 @@ server.tool(
 
       const accId = account.id as string;
 
-      const [txResult, devResult, caseResult, alertResult, sharedDevResult] = await Promise.all([
+      const [txResult, inboundResult, devResult, caseResult, alertResult, sharedDevResult, circularResult] = await Promise.all([
         graph.query(
           `MATCH (a:Account {id: $id})-[:SENT]->(tx:Transaction)-[:RECEIVED_BY]->(recv:Account)
            OPTIONAL MATCH (tx)-[:AT]->(m:Merchant)
            RETURN tx.id AS txId, tx.amount AS amount, tx.type AS type, tx.channel AS channel,
                   tx.timestamp AS timestamp, tx.status AS status, tx.is_international AS intl,
-                  recv.name AS receiver, m.name AS merchant, m.category AS merchant_category
+                  recv.name AS receiver, recv.risk_score AS receiver_risk, m.name AS merchant, m.category AS merchant_category
+           ORDER BY tx.timestamp DESC LIMIT 15`,
+          { params: { id: accId } }
+        ),
+        graph.query(
+          `MATCH (sender:Account)-[:SENT]->(tx:Transaction)-[:RECEIVED_BY]->(a:Account {id: $id})
+           RETURN tx.id AS txId, tx.amount AS amount, tx.type AS type,
+                  tx.timestamp AS timestamp, sender.name AS sender, sender.risk_score AS sender_risk
            ORDER BY tx.timestamp DESC LIMIT 15`,
           { params: { id: accId } }
         ),
@@ -165,7 +172,22 @@ server.tool(
                   other.kyc_verified AS kyc_verified`,
           { params: { id: accId } }
         ),
+        graph.query(
+          `MATCH (a:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(b:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(a)
+           WHERE tx2.timestamp > tx1.timestamp
+           RETURN a.name AS account, tx1.amount AS sent_amount, b.name AS through_account, tx2.amount AS returned_amount, tx1.timestamp AS sent_time, tx2.timestamp AS return_time, 2 AS hops`,
+          { params: { id: accId } }
+        ),
       ]);
+
+      const circular3Result = await graph.query(
+        `MATCH (a:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(b:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(c:Account)-[:SENT]->(tx3:Transaction)-[:RECEIVED_BY]->(a)
+         WHERE tx2.timestamp > tx1.timestamp AND tx3.timestamp > tx2.timestamp
+         RETURN a.name AS account, tx1.amount AS sent_amount, b.name + ' -> ' + c.name AS through_account, tx3.amount AS returned_amount, tx1.timestamp AS sent_time, tx3.timestamp AS return_time, 3 AS hops`,
+        { params: { id: accId } }
+      );
+
+      const allCircular = [...(circularResult.data ?? []), ...(circular3Result.data ?? [])];
 
       return {
         content: [{
@@ -173,10 +195,13 @@ server.tool(
           text: JSON.stringify({
             account,
             recentTransactions: txResult.data ?? [],
+            inboundTransactions: inboundResult.data ?? [],
             devices: devResult.data ?? [],
             fraudCases: caseResult.data ?? [],
             alerts: alertResult.data ?? [],
             sharedDeviceAccounts: sharedDevResult.data ?? [],
+            circularFlows: allCircular,
+            circularFlowDetected: allCircular.length > 0,
           }, null, 2),
         }],
       };
@@ -188,7 +213,7 @@ server.tool(
 
 server.tool(
   "trace_money_flow",
-  "Trace money flow from an account through multiple hops. Follows SENT→Transaction→RECEIVED_BY→Account chains. Detects circular flows and money mule networks.",
+  "Trace money flow from an account through multiple hops with temporal ordering. Detects circular flows (2 and 3 hop), amount correlation, and layering.",
   {
     accountName: z.string().describe("Starting account name or ID"),
     hops: z.number().min(1).max(4).default(2).describe("Number of hops to trace (1-4)"),
@@ -206,33 +231,54 @@ server.tool(
       const accId = (accResult.data?.[0] as Record<string, unknown>)?.id as string | undefined;
       if (!accId) return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Account not found" }) }] };
 
-      const flowResult = await graph.query(
-        `MATCH path = (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(a2:Account)${
-          depth >= 2 ? `-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(a3:Account)` : ""
-        }${depth >= 3 ? `-[:SENT]->(tx3:Transaction)-[:RECEIVED_BY]->(a4:Account)` : ""}
-         WHERE tx1.amount >= $min${depth >= 2 ? " AND tx2.amount >= $min" : ""}${depth >= 3 ? " AND tx3.amount >= $min" : ""}
-         RETURN start.name AS hop0, tx1.amount AS amt1, a2.name AS hop1${
-          depth >= 2 ? ", tx2.amount AS amt2, a3.name AS hop2" : ""
-        }${depth >= 3 ? ", tx3.amount AS amt3, a4.name AS hop3" : ""}
-         LIMIT 20`,
+      let flowQuery: string;
+      if (depth === 1) {
+        flowQuery = `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(a2:Account)
+         WHERE tx1.amount >= $min
+         RETURN start.name AS hop0, tx1.amount AS amt1, tx1.timestamp AS time1, a2.name AS hop1, a2.risk_score AS hop1_risk
+         ORDER BY tx1.timestamp LIMIT 20`;
+      } else if (depth === 2) {
+        flowQuery = `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(a2:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(a3:Account)
+         WHERE tx1.amount >= $min AND tx2.amount >= $min AND tx2.timestamp > tx1.timestamp
+         RETURN start.name AS hop0, tx1.amount AS amt1, tx1.timestamp AS time1, a2.name AS hop1,
+                tx2.amount AS amt2, tx2.timestamp AS time2, a3.name AS hop2, a3.risk_score AS hop2_risk
+         ORDER BY tx1.timestamp LIMIT 20`;
+      } else {
+        flowQuery = `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(a2:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(a3:Account)-[:SENT]->(tx3:Transaction)-[:RECEIVED_BY]->(a4:Account)
+         WHERE tx1.amount >= $min AND tx2.amount >= $min AND tx3.amount >= $min AND tx2.timestamp > tx1.timestamp AND tx3.timestamp > tx2.timestamp
+         RETURN start.name AS hop0, tx1.amount AS amt1, tx1.timestamp AS time1, a2.name AS hop1,
+                tx2.amount AS amt2, tx2.timestamp AS time2, a3.name AS hop2,
+                tx3.amount AS amt3, tx3.timestamp AS time3, a4.name AS hop3, a4.risk_score AS hop3_risk
+         ORDER BY tx1.timestamp LIMIT 20`;
+      }
+
+      const flowResult = await graph.query(flowQuery, { params: { id: accId, min: minAmount } });
+
+      const circular2Result = await graph.query(
+        `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(mid:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(start)
+         WHERE tx1.amount >= $min AND tx2.amount >= $min AND tx2.timestamp > tx1.timestamp
+         RETURN start.name AS from_account, tx1.amount AS sent_amount, tx1.timestamp AS sent_time,
+                mid.name AS through_account, tx2.amount AS returned_amount, tx2.timestamp AS return_time, 2 AS hops`,
         { params: { id: accId, min: minAmount } }
       );
 
-      const circularResult = await graph.query(
-        `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(mid:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(start)
-         WHERE tx1.amount >= $min AND tx2.amount >= $min
-         RETURN start.name AS from_account, tx1.amount AS sent_amount,
-                mid.name AS through_account, tx2.amount AS returned_amount`,
+      const circular3Result = await graph.query(
+        `MATCH (start:Account {id: $id})-[:SENT]->(tx1:Transaction)-[:RECEIVED_BY]->(mid1:Account)-[:SENT]->(tx2:Transaction)-[:RECEIVED_BY]->(mid2:Account)-[:SENT]->(tx3:Transaction)-[:RECEIVED_BY]->(start)
+         WHERE tx1.amount >= $min AND tx2.amount >= $min AND tx3.amount >= $min AND tx2.timestamp > tx1.timestamp AND tx3.timestamp > tx2.timestamp
+         RETURN start.name AS from_account, tx1.amount AS sent_amount, tx1.timestamp AS sent_time,
+                mid1.name + ' -> ' + mid2.name AS through_account, tx3.amount AS returned_amount, tx3.timestamp AS return_time, 3 AS hops`,
         { params: { id: accId, min: minAmount } }
       );
+
+      const allCircular = [...(circular2Result.data ?? []), ...(circular3Result.data ?? [])];
 
       return {
         content: [{
           type: "text" as const,
           text: JSON.stringify({
             moneyFlow: flowResult.data ?? [],
-            circularFlows: circularResult.data ?? [],
-            circularFlowDetected: (circularResult.data?.length ?? 0) > 0,
+            circularFlows: allCircular,
+            circularFlowDetected: allCircular.length > 0,
           }, null, 2),
         }],
       };
@@ -263,9 +309,10 @@ server.tool(
                   m.category AS category, sum(tx.amount) AS total_amount,
                   count(tx) AS tx_count, m.is_shell_company AS shell ORDER BY total_amount DESC`,
         structuring: `MATCH (a:Account)-[:SENT]->(tx:Transaction)
-           WHERE tx.amount >= 4500 AND tx.amount < 5000
+           WHERE (tx.amount >= 4500 AND tx.amount < 5000) OR (tx.amount >= 9000 AND tx.amount < 10000)
            RETURN a.name AS account, a.id AS accountId, tx.amount AS amount,
-                  tx.timestamp AS timestamp, tx.type AS type ORDER BY tx.timestamp DESC`,
+                  tx.timestamp AS timestamp, tx.type AS type,
+                  CASE WHEN tx.amount < 5000 THEN '$5k threshold' ELSE '$10k threshold' END AS threshold ORDER BY tx.timestamp DESC`,
         velocity: `MATCH (a:Account)-[:SENT]->(tx:Transaction)
            WITH a, sum(tx.amount) AS total, count(tx) AS count
            WHERE total > a.avg_monthly_volume * 3
